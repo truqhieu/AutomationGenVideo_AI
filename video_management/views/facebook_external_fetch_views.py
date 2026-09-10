@@ -12,9 +12,8 @@ from rest_framework.decorators import api_view, permission_classes
 from rest_framework.permissions import IsAuthenticated
 from rest_framework.response import Response
 
-from ..services.rapidapi_facebook import (
-    fetch_page_profile, fetch_reels_only, parse_fanpage_profile, parse_facebook_reels,
-)
+from ..services import apify_facebook as apify_svc
+from ..services import rapidapi_facebook as rapidapi_svc
 
 # Handle không phải tên page — không dùng làm định danh fallback được.
 _NON_PAGE_HANDLES = {'profile.php', 'watch', 'reel', 'reels', 'groups', 'share'}
@@ -95,12 +94,44 @@ def fetch_facebook_page_reels(request):
     if not page_url:
         return Response({'error': 'page_url is required'}, status=400)
 
-    num = int(data.get('num_of_posts') or 30)
+    num = int(data.get('num_of_posts') or 50)
     exclude_post_ids = data.get('exclude_post_ids') or []
     start_date = (data.get('start_date') or '').strip()
 
-    profile = fetch_page_profile(page_url)
-    reels_raw = fetch_reels_only(
+    # Ưu tiên 1: Sử dụng Apify
+    profile = None
+    reels_raw = []
+    apify_profile = None
+
+    if apify_svc._get_apify_token():
+        reels_raw = apify_svc.fetch_reels_only(
+            page_url=page_url,
+            num_of_posts=num,
+            exclude_post_ids=exclude_post_ids,
+            start_date=start_date,
+        )
+        first_reel = reels_raw[0] if reels_raw else {}
+        apify_profile = apify_svc.parse_fanpage_profile(None, first_reel)
+
+        # Nếu chưa lấy được profile từ reels hoặc không có reels, gọi pages-scraper bổ sung
+        if not apify_profile:
+            profile = apify_svc.fetch_page_profile(page_url)
+            if profile:
+                apify_profile = apify_svc.parse_fanpage_profile(profile, first_reel)
+
+        if apify_profile or reels_raw:
+            parsed_profile = apify_profile or _build_fallback_profile(page_url) or None
+            parsed_reels = apify_svc.parse_facebook_reels(reels_raw)
+            return Response({
+                'profile_api_ok': apify_profile is not None,
+                'fallback_used': apify_profile is None and parsed_profile is not None,
+                'profile': parsed_profile,
+                'reels': parsed_reels,
+            })
+
+    # Ưu tiên 2: Fallback sang RapidAPI nếu Apify không trả được gì
+    profile = rapidapi_svc.fetch_page_profile(page_url)
+    reels_raw = rapidapi_svc.fetch_reels_only(
         page_url=page_url,
         num_of_posts=num,
         exclude_post_ids=exclude_post_ids,
@@ -108,15 +139,14 @@ def fetch_facebook_page_reels(request):
         profile=profile,
     )
 
-    # Dữ liệu thật từ RapidAPI: profile API, hoặc author trong reel đầu tiên.
     rapidapi_profile = None
     if profile or reels_raw:
         first_reel = reels_raw[0] if reels_raw else {}
-        rapidapi_profile = parse_fanpage_profile(profile, first_reel)
+        rapidapi_profile = rapidapi_svc.parse_fanpage_profile(profile, first_reel)
 
     parsed_profile = rapidapi_profile or _build_fallback_profile(page_url) or None
+    parsed_reels = rapidapi_svc.parse_facebook_reels(reels_raw)
 
-    parsed_reels = parse_facebook_reels(reels_raw)
     return Response({
         'profile_api_ok': rapidapi_profile is not None,
         'fallback_used': rapidapi_profile is None and parsed_profile is not None,
